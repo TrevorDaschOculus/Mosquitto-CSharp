@@ -1,0 +1,47 @@
+<!--
+Copyright (c) 2019 Chris Burns <chris@kitty.city>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    
+    <PropertyGroup>
+        <SlnDir>$(MSBuildThisFileDirectory)</SlnDir>
+        <SlnDir Condition="!HasTrailingSlash('$(SlnDir)')">$(SlnDir)\</SlnDir>
+        
+        <SdkDir>$(MSBuildExtensionsPath)</SdkDir>
+        <SdkDir Condition="!HasTrailingSlash('$(SdkDir)')">$(SdkDir)\</SdkDir>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <OSPlatformWindows Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' == 'true'">true</OSPlatformWindows>
+        <OSPlatformLinux Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))' == 'true'">true</OSPlatformLinux>
+        <OSPlatformOSX Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))' == 'true'">true</OSPlatformOSX>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <PluginPrefix Condition="'$(OSPlatformLinux)' == 'true'">lib</PluginPrefix>
+		<PluginPrefix Condition="'$(OSPlatformOSX)' == 'true'">lib</PluginPrefix>
+
+        <PluginExt Condition="'$(PluginExt)' == ''">dll</PluginExt>
+        <PluginExt Condition="'$(OSPlatformLinux)' == 'true'">so</PluginExt>
+        <PluginExt Condition="'$(OSPlatformOSX)' == 'true'">dylib</PluginExt>
+    </PropertyGroup>
+    
+</Project>

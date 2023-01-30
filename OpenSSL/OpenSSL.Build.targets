@@ -1,0 +1,135 @@
+<!--
+Copyright (c) 2022 Trevor Dasch
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+OpenSSL build driver
+All key properties are overridable from CLI (-p:PropName=PropVal) or PropertyGroup
+
+OpenSSLSourceDir - path to OpenSSL Source
+OpenSSLBinaryDir - path to drop all the outputs
+OpenSSLTarget - The Configure target for openssl
+
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+    <PropertyGroup>
+        <OpenSSLSourceDir Condition="'$(OpenSSLSourceDir)' == ''">$(SlnDir)third-party/openssl/src</OpenSSLSourceDir>
+        <OpenSSLBinaryDir Condition="'$(OpenSSLBinaryDir)' == '' AND '$(OSPlatformWindows)' == 'true'">$(SlnDir)third-party/openssl/out/Windows</OpenSSLBinaryDir>
+        <OpenSSLBinaryDir Condition="'$(OpenSSLBinaryDir)' == '' AND '$(OSPlatformWindows)' != 'true'">$(SlnDir)third-party/openssl/out/Linux</OpenSSLBinaryDir>
+        <OpenSSLPlatform Condition="'$(Platform)' == 'x86_64' OR '$(Platform)' == 'x64' OR '$(Platform)' == 'AnyCPU'">x64</OpenSSLPlatform>
+        <OpenSSLPlatform Condition="'$(Platform)' == 'x86'">x86</OpenSSLPlatform>
+        <OpenSSLTarget Condition="'$(OSPlatformWindows)' == 'true' AND '$(OpenSSLPlatform)' == 'x64'">VC-WIN64A</OpenSSLTarget>
+        <OpenSSLTarget Condition="'$(OSPlatformWindows)' != 'true' AND '$(OpenSSLPlatform)' == 'x64'">linux-x86_64-clang</OpenSSLTarget>
+        <OpenSSLTarget Condition="'$(OSPlatformWindows)' == 'true' AND '$(OpenSSLPlatform)' == 'x86'">VC-WIN32</OpenSSLTarget>
+        <OpenSSLTarget Condition="'$(OSPlatformWindows)' != 'true' AND '$(OpenSSLPlatform)' == 'x86'">linux-x86-clang</OpenSSLTarget>
+        <OpenSSLOpts Condition="'$(Configuration)' == 'Debug'">$(OpenSSLOpts) --debug</OpenSSLOpts>
+        <VCVarsAll Condition="'$(OSPlatformWindows)' == 'true'">cmd.exe /c &quot;&quot;$(DevEnvDir)..\..\VC\Auxiliary\Build\vcvarsall.bat&quot; $(OpenSSLPlatform) &amp;&quot;</VCVarsAll>
+        <OpenSSLLibExt Condition="'$(OSPlatformWindows)' == 'true'">lib</OpenSSLLibExt>
+        <OpenSSLLibExt Condition="'$(OSPlatformWindows)' != 'true'">a</OpenSSLLibExt>
+        <OpenSSLCryptoLibRelease>$(OpenSSLBinaryDir)/lib/libcrypto.$(OpenSSLLibExt)</OpenSSLCryptoLibRelease>
+        <OpenSSLSslLibRelease>$(OpenSSLBinaryDir)/lib/libssl.$(OpenSSLLibExt)</OpenSSLSslLibRelease>
+        <OpenSSLCryptoLibDebug>$(OpenSSLBinaryDir)/lib/libcryptod.$(OpenSSLLibExt)</OpenSSLCryptoLibDebug>
+        <OpenSSLSslLibDebug>$(OpenSSLBinaryDir)/lib/libssld.$(OpenSSLLibExt)</OpenSSLSslLibDebug>
+    </PropertyGroup>
+
+    <Target Name="TestForJom">
+        <Exec Command="jom.exe -version >NUL 2>&amp;1" IgnoreExitCode="True">
+            <Output TaskParameter="ExitCode" PropertyName="JomExitCode" />
+        </Exec>
+    </Target>
+
+    <Target Name="OpenSSLConfigTarget" BeforeTargets="OpenSSLClean;OpenSSLBuild" DependsOnTargets="TestForJom">
+        <PropertyGroup Condition="'$(OSPlatformWindows)' == 'true'">
+            <OpenSSLOpts Condition="'$(JomExitCode)' == '0'">$(OpenSSLOpts) -MP -FS -wd4267 -wd4244 -wd4133 -wd4311</OpenSSLOpts>
+            <OpenSSLOpts Condition="'$(JomExitCode)' != '0'">$(OpenSSLOpts) -wd4267 -wd4244 -wd4133 -wd4311</OpenSSLOpts>
+        </PropertyGroup>
+
+        <Message Text="OpenSSL -- configuring $(OpenSSLTarget)" Importance="high" />
+
+        <!-- compare previous config call to see if this is necessary -->
+        <Exec Command="perl configdata.pm -c" WorkingDirectory="$(OpenSSLSourceDir)" IgnoreExitCode="True" ConsoleToMsBuild="True" StandardOutputImportance="Low">
+            <Output TaskParameter="ConsoleOutput" PropertyName="OpenSSLConfigCommandLine" />
+            <Output TaskParameter="ExitCode" PropertyName="OpenSSLConfigExitCode" />
+        </Exec>
+
+        <PropertyGroup>
+            <PrevArgs Condition="'$(OpenSSLConfigExitCode)' == '0'">$([System.Text.RegularExpressions.Regex]::Match($(OpenSSLConfigCommandLine), `Configure [^;]*`))</PrevArgs>
+            <CurrArgsRaw>Configure $(OpenSSLTarget) $(OpenSSLOpts) --prefix=$(OpenSSLBinaryDir)</CurrArgsRaw>
+            <CurrArgs>$([System.Text.RegularExpressions.Regex]::Replace($(CurrArgsRaw), `\s+`, ` `))</CurrArgs>
+        </PropertyGroup>
+
+        <Message Text="OpenSSL -- reusing previous configuration" Importance="high" Condition="'$(CurrArgs)' == '$(PrevArgs)'" />
+        <Message Text="OpenSSL -- perl $(CurrArgs)" Importance="high" Condition="'$(CurrArgs)' != '$(PrevArgs)'" />
+        <Exec Command="$(VCVarsAll) perl $(CurrArgs)" WorkingDirectory="$(OpenSSLSourceDir)" StandardOutputImportance="low" StandardErrorImportance="high" Condition="'$(CurrArgs)' != '$(PrevArgs)'" />
+        <OnError ExecuteTargets="OpenSSLBuildFailed" />
+    </Target>
+  
+    <Target Name="OpenSSLClean">
+        <Message Text="OpenSSL -- cleaning project" Importance="high" />
+        <PropertyGroup>
+            <OpenSSLMake Condition="'$(OSPlatformWindows)' == 'true'">nmake.exe</OpenSSLMake>
+            <OpenSSLMake Condition="'$(OSPlatformWindows)' != 'true'">make -j $(MSBuildNodeCount)</OpenSSLMake>
+        </PropertyGroup>
+        <RemoveDir Directories="$(OpenSSLBinaryDir)"/>
+        <MakeDir Directories="$(OpenSSLBinaryDir)"/>
+        <Message Text="$(OpenSSLMake) clean" Importance="high" />
+        <Exec Command="$(OpenSSLMake) clean" WorkingDirectory="$(OpenSSLSourceDir)" StandardOutputImportance="low" StandardErrorImportance="low" />
+        <OnError ExecuteTargets="OpenSSLCleanFailed" />
+    </Target>
+
+    <Target Name="OpenSSLBuild" DependsOnTargets="TestForJom">
+        <PropertyGroup>
+            <ProcessorCount>$([System.Environment]::ProcessorCount)</ProcessorCount>
+            <OpenSSLMake Condition="'$(OSPlatformWindows)' == 'true' AND '$(JomExitCode)' == '0'">jom.exe /j$(ProcessorCount)</OpenSSLMake>
+            <OpenSSLMake Condition="'$(OSPlatformWindows)' == 'true' AND '$(JomExitCode)' != '0'">nmake.exe</OpenSSLMake>
+            <OpenSSLMake Condition="'$(OSPlatformWindows)' != 'true'">make -j $(ProcessorCount)</OpenSSLMake>
+        </PropertyGroup>
+        <Message Text="OpenSSL -- building $(OpenSSLTarget)" Importance="high" />
+        <Message Condition="'$(JomExitCode)' != '0'" Text="OpenSSL -- jom not found, using nmake. We recommend installing jom for faster builds: https://wiki.qt.io/Jom" Importance="high" />
+        <Message Text="$(OpenSSLMake) all &amp;&amp; $(OpenSSLMake) install_sw" Importance="high" />
+        <!-- There's a strange issue when using jom that 'jom install_sw' sometimes fails (I assume due to a race condition). Retrying always seems to succeed from my testing. -->
+        <Exec Command="$(VCVarsAll) $(OpenSSLMake) all &amp;&amp; $(VCVarsAll) $(OpenSSLMake) install_sw || $(VCVarsAll) $(OpenSSLMake) install_sw" WorkingDirectory="$(OpenSSLSourceDir)" StandardOutputImportance="low" StandardErrorImportance="high" />
+        <!-- copy openssl libraries to the version with a d suffix for cmake to find for debug builds -->
+        <Copy SourceFiles="$(OpenSSLCryptoLibRelease)" DestinationFiles="$(OpenSSLCryptoLibDebug)" />
+        <Copy SourceFiles="$(OpenSSLSslLibRelease)" DestinationFiles="$(OpenSSLSslLibDebug)" />
+        <OnError ExecuteTargets="OpenSSLBuildFailed" />
+    </Target>
+
+    <Target Name="OpenSSLBuildConditional" Condition="!Exists('$(OpenSSLCryptoLibRelease)') OR !Exists('$(OpenSSLCryptoLibDebug)') OR !Exists('$(OpenSSLSslLibRelease)') OR !Exists('$(OpenSSLSslLibDebug)')">
+        <CallTarget Targets="OpenSSLBuild" />
+    </Target>
+
+    <Target Name="OpenSSLBuildSuccess" AfterTargets="OpenSSLBuild">
+        <Message Text="OpenSSL -- build succeeded" Importance="high" />
+    </Target>
+
+    <Target Name="OpenSSLCleanFailed">
+        <Warning Text="OpenSSL -- the most common cause of OpenSSL clean errors is file locking (eg. windows console in the build dir)" />
+        <Warning Text="OpenSSL -- please unlock or reboot and try cleaning again" />
+        <Error Text="OpenSSL -- build failed" />
+    </Target>
+
+    <Target Name="OpenSSLBuildFailed">
+        <Warning Text="OpenSSL -- the most common cause of OpenSSL build errors is missing tools (perl, MSVC, and NASM)" />
+        <Warning Text="OpenSSL -- please follow the instructions in third-party/openssl/src/NOTES.WIN" />
+        <Error Text="OpenSSL -- build failed" />
+    </Target>
+
+</Project>

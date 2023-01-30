@@ -1,0 +1,8 @@
+[submodule "third-party/mosquitto/src"]
+	path = third-party/mosquitto/src
+	url = https://github.com/TrevorDaschOculus/mosquitto
+	branch = feature/windows_threading
+[submodule "third-party/openssl/src"]
+	path = third-party/openssl/src
+	url = https://github.com/openssl/openssl
+	branch = OpenSSL_1_1_1-stable
