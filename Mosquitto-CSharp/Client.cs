@@ -14,8 +14,8 @@ namespace Mosquitto
 
         #endregion
 
-        public Client(string id, bool cleanSession = true) : base(id, cleanSession,
-            Native.PROTOCOL_VERSION_v311)
+        public Client(string id, bool cleanSession = true, ReconnectSettings reconnectSettings = default) : base(id, cleanSession,
+            Native.PROTOCOL_VERSION_v311, reconnectSettings)
         { }
 
         /// <summary>

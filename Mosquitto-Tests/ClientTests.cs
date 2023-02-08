@@ -12,7 +12,8 @@ using NUnit.Framework;
 namespace Mosquitto.Tests
 {
     [TestFixture]
-    public class ClientTests {
+    public class ClientTests 
+    {
 
         private static string _pwd = Environment.CurrentDirectory;
         private static string _slnPath = _pwd.Substring(0, _pwd.IndexOf("Mosquitto-CSharp", StringComparison.InvariantCulture)) + "Mosquitto-CSharp/";
@@ -364,6 +365,146 @@ namespace Mosquitto.Tests
                 {
                     Assert.IsAssignableFrom(typeof(ErrorException), e);
                 }
+            }
+        }
+
+        [Test]
+        public async Task ReconnectAsync()
+        {
+            int port = _port;
+            using (var client = new Client("test"))
+            using (new MosquittoServer(port))
+            {
+                await client.ConnectAsync("127.0.0.1", port, cancellationToken: CancelAfter(TimeSpan.FromSeconds(1)));
+
+                await client.DisconnectAsync(cancellationToken: CancelAfter(TimeSpan.FromSeconds(1)));
+
+                await client.ReconnectAsync(cancellationToken: CancelAfter(TimeSpan.FromSeconds(1)));
+            }
+        }
+
+        [Test]
+        public async Task RemoteDisconnect()
+        {
+            int port = _port;
+            using (var client = new Client("test"))
+            {
+                int disconnectCount = 0;
+                void OnDisconnected(Error err)
+                {
+                    disconnectCount++;
+                    Assert.AreNotEqual(Error.Success, err);
+                }
+
+                client.onDisconnectedEvent += OnDisconnected;
+
+                using (new MosquittoServer(port))
+                {
+                    await client.ConnectAsync("127.0.0.1", port, keepalive: 10, cancellationToken: CancelAfter(TimeSpan.FromSeconds(1)));
+                }
+
+                for (int i = 0; i < 100 && disconnectCount == 0; i++)
+                {
+                    Thread.Sleep(10);
+                }
+
+                Assert.AreEqual(1, disconnectCount, "Expected OnDisconnect to be called");
+            }
+        }
+
+        [Test, TestCase(true), TestCase(false)]
+        public async Task SubscribeAfterAutoReconnect(bool clearSession)
+        {
+            int port = _port;
+            using (var client = new Client("test", clearSession, reconnectSettings: new ClientBase.ReconnectSettings(reconnectAutomatically: true, maximumReconnectDelay: 1)))
+            {
+                int disconnectCount = 0;
+                void OnDisconnected(Error err)
+                {
+                    disconnectCount++;
+                }
+
+                client.onDisconnectedEvent += OnDisconnected;
+
+                using (new MosquittoServer(port))
+                {
+                    await client.ConnectAsync("127.0.0.1", port, keepalive: 10, cancellationToken: CancelAfter(TimeSpan.FromSeconds(1)));
+                }
+
+                for (int i = 0; i < 100 && disconnectCount == 0; i++)
+                {
+                    Thread.Sleep(10);
+                }
+
+                Assert.AreEqual(0, disconnectCount, "Expected OnDisconnect not to be called");
+
+
+                int subscribeCount = 0;
+                void OnSubscribed(QualityOfService qos)
+                {
+                    subscribeCount++;
+                }
+
+                using (new MosquittoServer(port))
+                {
+                    client.Subscribe("test", QualityOfService.AtLeastOnce, OnSubscribed);
+
+                    for (int i = 0; i < 500 && subscribeCount == 0; i++)
+                    {
+                        Thread.Sleep(10);
+                    }
+                }
+
+                Assert.AreEqual(1, subscribeCount, "Expected OnSubscribe to be called exactly once");
+                Assert.AreEqual(0, disconnectCount, "Expected OnDisconnect not to be called");
+            }
+        }
+
+        [Test, TestCase(true), TestCase(false)]
+        public async Task SubscribeAfterManualReconnect(bool clearSession)
+        {
+            int port = _port;
+            using (var client = new Client("test", clearSession))
+            {
+                int disconnectCount = 0;
+                void OnDisconnected(Error err)
+                {
+                    disconnectCount++;
+                }
+
+                client.onDisconnectedEvent += OnDisconnected;
+
+                using (new MosquittoServer(port))
+                {
+                    await client.ConnectAsync("127.0.0.1", port, keepalive: 10, cancellationToken: CancelAfter(TimeSpan.FromSeconds(1)));
+                }
+
+                for (int i = 0; i < 100 && disconnectCount == 0; i++)
+                {
+                    Thread.Sleep(10);
+                }
+
+                Assert.AreEqual(1, disconnectCount, "Expected OnDisconnect to be called");
+
+                int subscribeCount = 0;
+                void OnSubscribed(QualityOfService qos)
+                {
+                    subscribeCount++;
+                }
+
+                using (new MosquittoServer(port))
+                {
+                    await client.ReconnectAsync(cancellationToken: CancelAfter(TimeSpan.FromSeconds(1)));
+
+                    client.Subscribe("test", QualityOfService.AtLeastOnce, OnSubscribed);
+
+                    for (int i = 0; i < 500 && subscribeCount == 0; i++)
+                    {
+                        Thread.Sleep(10);
+                    }
+                }
+
+                Assert.AreEqual(1, subscribeCount, "Expected OnSubscribe to be called exactly once");
             }
         }
 

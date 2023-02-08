@@ -377,6 +377,42 @@ namespace Mosquitto
             public ManagedPropertyListV5 properties;
         }
 
+        private struct PendingSubscribe
+        {
+            public readonly string topic;
+            public readonly string[] topics;
+            public readonly QualityOfService qos;
+            public readonly CallbackList cb;
+
+            public PendingSubscribe(string topic, QualityOfService qos, CallbackList cb)
+            {
+                this.topic = topic;
+                this.topics = null;
+                this.qos = qos;
+                this.cb = cb;
+            }
+
+            public PendingSubscribe(string[] topics, QualityOfService qos, CallbackList cb)
+            {
+                this.topic = null;
+                this.topics = topics;
+                this.qos = qos;
+                this.cb = cb;
+            }
+        }
+
+        private struct PendingUnsubscribe
+        {
+            public readonly string topic;
+            public readonly CallbackList cb;
+
+            public PendingUnsubscribe(string topic, CallbackList cb)
+            {
+                this.topic = topic;
+                this.cb = cb;
+            }
+        }
+
 
         private sealed class ConnectionParams : IDisposable
         {
@@ -402,11 +438,29 @@ namespace Mosquitto
             }
         }
 
+        public struct ReconnectSettings
+        {
+            public readonly bool reconnectAutomatically;
+            public readonly int initialReconnectDelay;
+            public readonly int maximumReconnectDelay;
+            public readonly bool exponentialBackoff;
+
+            public ReconnectSettings(bool reconnectAutomatically, int initialReconnectDelay = 1,
+                int maximumReconnectDelay = 60, bool exponentialBackoff = true)
+            {
+                this.reconnectAutomatically = reconnectAutomatically;
+                this.initialReconnectDelay = initialReconnectDelay;
+                this.maximumReconnectDelay = maximumReconnectDelay;
+                this.exponentialBackoff = exponentialBackoff;
+            }
+        }
+
         private enum State
         {
             New,
             Connecting,
             Connected,
+            Reconnecting,
             Disconnecting,
             Disconnected,
             Disposed
@@ -566,26 +620,53 @@ namespace Mosquitto
         private GetPassword _getPassword;
         #endregion
 
+        private readonly bool _cleanSession;
         private readonly int _protocolVersion;
+        private readonly ReconnectSettings _reconnectSettings;
         private readonly SynchronizationContext _defaultContext;
 
+        private readonly ManualResetEvent _reconnectResetEvent = new ManualResetEvent(false);
+
         private Thread _thread;
+        // this is set when we connect, so that we have it available if we reconnect
+        private int _loopTimeout;
+        // this is set to 0 every time a successful connection is made
+        private int _reconnects;
 
         private const int _maxReusableContainers = 32;
         private readonly ConcurrentBag<ReusableCallbackContainer> _reusableCallbackContainers = new ConcurrentBag<ReusableCallbackContainer>();
 
+        // These are only accessed on our worker thread
+        private readonly Dictionary<string, QualityOfService> _subscriptions = new Dictionary<string, QualityOfService>();
+        private readonly List<PendingSubscribe> _subscribeOnReconnectList = new List<PendingSubscribe>();
+        private readonly List<PendingUnsubscribe> _unsubscribeOnReconnectList = new List<PendingUnsubscribe>();
+
         private readonly SendOrPostCallback _sendOrPostCallback;
         private readonly WaitCallback _waitCallback;
 
-
+        private readonly object _connectionCallbackMutex = new object();
         private CallbackList _connectionCallbacks;
-        private readonly Dictionary<int, CallbackList> _subscribeCallbacks = new Dictionary<int, CallbackList>();
-        private readonly Dictionary<int, CallbackList> _unsubscribeCallbacks = new Dictionary<int, CallbackList>();
+        private readonly Dictionary<int, PendingSubscribe> _subscribeCallbacks = new Dictionary<int, PendingSubscribe>();
+        private readonly Dictionary<int, PendingUnsubscribe> _unsubscribeCallbacks = new Dictionary<int, PendingUnsubscribe>();
         private readonly Dictionary<int, CallbackList> _publishCallbacks = new Dictionary<int, CallbackList>();
 
-        private volatile State _state;
-
         private MosquittoPtr _mosq;
+
+
+        // Use an int backing field so we can take advantage of interlocked
+        private int _currentState;
+
+        private State currentState
+        {
+            get
+            {
+                return (State) Interlocked.CompareExchange(ref _currentState, 0, 0);
+            }
+            set
+            {
+                Interlocked.Exchange(ref _currentState, (int) value);
+            }
+        }
 
 
         /// <param name="id">String to use as the client id. If null, a random client id will be generated.
@@ -601,12 +682,14 @@ namespace Mosquitto
         /// internal thread, or if the Update must be called regularly. When executing
         /// in threaded mode, events may be called on threads other than the thread that this
         /// instance was created on.</param>
-        public ClientBase(string id, bool cleanSession, int protocolVersion)
+        public ClientBase(string id, bool cleanSession, int protocolVersion, ReconnectSettings reconnectSettings)
         {
             // ensure our library is initialized
             Native.Initialize();
             _mosq = Native.mosquitto_new(id, cleanSession, IntPtr.Zero);
             _protocolVersion = protocolVersion;
+            _cleanSession = cleanSession;
+            _reconnectSettings = reconnectSettings;
             _defaultContext = SynchronizationContext.Current;
             // create delegate from our method once to avoid repeated boxing
             _sendOrPostCallback = InvokeCallbacks;
@@ -731,6 +814,7 @@ namespace Mosquitto
                 // disconnect if we are still connected
                 DisconnectInternal(disconnectImmediately: true);
                 WaitForThread();
+                currentState = State.Disposed;
                 Native.mosquitto_destroy(_mosq);
                 _mosq = IntPtr.Zero;
             }
@@ -764,42 +848,51 @@ namespace Mosquitto
 
         private void StartThread(ConnectionParams connectionParams, CallbackList callbackList)
         {
-            if (_state == State.Connecting || _state == State.Connected)
-            {
-                callbackList.onConnectFailed?.Invoke(Error.AlreadyExists, ConnectFailedReason.ServerUnavailable);
-                connectionParams?.Dispose();
-                return;
-            }
-            if (_state == State.Disposed)
+            var currentState = this.currentState;
+            if (currentState == State.Disposed)
             {
                 callbackList.onConnectFailed?.Invoke(Error.Inval, ConnectFailedReason.ServerUnavailable);
                 connectionParams?.Dispose();
                 return;
             }
 
+            if (currentState == State.Connecting || currentState == State.Connected || currentState == State.Reconnecting)
+            {
+                callbackList.onConnectFailed?.Invoke(Error.AlreadyExists, ConnectFailedReason.Unspecified);
+                connectionParams?.Dispose();
+                return;
+            }
+
             WaitForThread();
 
-            _state = State.Connecting;
-            _connectionCallbacks = callbackList;
+            if (connectionParams == null)
+            {
+                this.currentState = State.Reconnecting;
+            }
+            else
+            {
+                ClearSessionCallbacks();
+                this.currentState = State.Connecting;
+            }
+
+            lock (_connectionCallbackMutex)
+            {
+                _connectionCallbacks = callbackList;
+            }
             _thread = new Thread(ThreadExecute);
             _thread.Start(connectionParams);
         }
 
         protected Error SubscribeInternal(string topic, QualityOfService qos, int options = 0, PropertyListV5 properties = default, OnSubscribed onSubscribed = null, OnSubscribedV5 onSubscribedV5 = null)
         {
-            var cb = new CallbackList { context = SynchronizationContext.Current, onSubscribed = onSubscribed, onSubscribedV5 = onSubscribedV5 };
-            if (cb.isEmpty)
-            {
-                int messageId = 0;
-                return (Error)Native.mosquitto_subscribe_v5(_mosq, ref messageId, topic, (int)qos, options, properties.nativePropertyList);
-            }
+            var cb = new CallbackList { context = SynchronizationContext.Current, onSubscribed = onSubscribed, onSubscribedV5 = onSubscribedV5 };            
             lock (_subscribeCallbacks)
             {
                 int messageId = 0;
                 Error error = (Error)Native.mosquitto_subscribe_v5(_mosq, ref messageId, topic, (int)qos, options, properties.nativePropertyList);
                 if (error == Error.Success)
                 {
-                    _subscribeCallbacks.Add(messageId, cb);
+                    _subscribeCallbacks.Add(messageId, new PendingSubscribe(topic, qos, cb));
                 }
                 return error;
             }
@@ -807,19 +900,14 @@ namespace Mosquitto
 
         protected Error SubscribeMultipleInternal(string[] topics, QualityOfService qos, int options = 0, PropertyListV5 properties = default, OnSubscribedMultiple onSubscribed = null, OnSubscribedMultipleV5 onSubscribedV5 = null)
         {
-            var cb = new CallbackList { context = SynchronizationContext.Current, onSubscribedMultiple = onSubscribed, onSubscribedMultipleV5 = onSubscribedV5 };
-            if (cb.isEmpty)
-            {
-                int messageId = 0;
-                return (Error)Native.mosquitto_subscribe_multiple(_mosq, ref messageId, topics.Length, topics, (int)qos, options, properties.nativePropertyList);
-            }
+            var cb = new CallbackList { context = SynchronizationContext.Current, onSubscribedMultiple = onSubscribed, onSubscribedMultipleV5 = onSubscribedV5 };            
             lock (_subscribeCallbacks)
             {
                 int messageId = 0;
                 Error error = (Error)Native.mosquitto_subscribe_multiple(_mosq, ref messageId, topics.Length, topics, (int)qos, options, properties.nativePropertyList);
                 if (error == Error.Success)
                 {
-                    _subscribeCallbacks.Add(messageId, cb);
+                    _subscribeCallbacks.Add(messageId, new PendingSubscribe(topics, qos, cb));
                 }
                 return error;
             }
@@ -827,19 +915,14 @@ namespace Mosquitto
 
         protected Error UnsubscribeInternal(string topic, PropertyListV5 properties = default, OnUnsubscribed onUnsubscribed = null, OnUnsubscribedV5 onUnsubscribedV5 = null)
         {
-            var cb = new CallbackList { context = SynchronizationContext.Current, onUnsubscribed = onUnsubscribed, onUnsubscribedV5 = onUnsubscribedV5 };
-            if (cb.isEmpty)
-            {
-                int messageId = 0;
-                return (Error)Native.mosquitto_unsubscribe_v5(_mosq, ref messageId, topic, properties.nativePropertyList);
-            }
+            var cb = new CallbackList { context = SynchronizationContext.Current, onUnsubscribed = onUnsubscribed, onUnsubscribedV5 = onUnsubscribedV5 };            
             lock (_unsubscribeCallbacks)
             {
                 int messageId = 0;
                 Error error = (Error)Native.mosquitto_unsubscribe_v5(_mosq, ref messageId, topic, properties.nativePropertyList);
                 if (error == Error.Success)
                 {
-                    _unsubscribeCallbacks.Add(messageId, cb);
+                    _unsubscribeCallbacks.Add(messageId, new PendingUnsubscribe(topic, cb));
                 }
                 return error;
             }
@@ -868,10 +951,51 @@ namespace Mosquitto
 
         protected Error DisconnectInternal(bool disconnectImmediately = false, bool sendWill = false, PropertyListV5 properties = default)
         {
-            _state = disconnectImmediately ? State.Disconnected : State.Disconnecting;
+            var currentState = this.currentState;
+            if (currentState == State.Disposed)
+            {
+                return Error.Inval;
+            }
+
+            if (currentState == State.Disconnected || (currentState == State.Disconnecting && !disconnectImmediately))
+            {
+                return Error.Success;
+            }
+
+            if (disconnectImmediately)
+            {
+                SetDisconnected(Error.Success);
+            }
+            else
+            {
+                this.currentState = State.Disconnecting;
+            }
+            _reconnectResetEvent.Set();
             return (Error)Native.mosquitto_disconnect_v5(_mosq, sendWill ? (int)DisconnectReasonV5.DisconnectWithWillMsg : (int)DisconnectReasonV5.NormalDisconnection, properties.nativePropertyList);
         }
 
+        /// <summary>
+        /// Try to update the value of state by comparing to a given state
+        /// </summary>
+        /// <param name="newState">The State to set state to</param>
+        /// <param name="expectedState">The State we expect state is set to</param>
+        /// <param name="trueIfAlreadySet">Whether we should return true if the state was already the expected state</param>
+        /// <returns>true if state is now set to newState from expectedState (or if it was already set to newState, and trueIfAlreadySet is true)</returns>
+        private bool TryUpdateState(State newState, State expectedState, bool trueIfAlreadySet = true)
+        {
+            int prevState = Interlocked.CompareExchange(ref _currentState, (int) newState, (int) expectedState);
+            return prevState == (int)expectedState || (trueIfAlreadySet && prevState == (int)newState);
+        }
+
+        /// <summary>
+        /// Updates the state to the given state, returns the previous state
+        /// </summary>
+        /// <param name="newState">The State to set our current state to</param>
+        /// <returns></returns>
+        private State ExchangeState(State newState)
+        {
+            return (State)Interlocked.Exchange(ref _currentState, (int) newState);
+        }
 
         private void WaitForThread()
         {
@@ -883,31 +1007,66 @@ namespace Mosquitto
 
         private void ThreadExecute(object arg)
         {
-            ConnectionParams connectionParams = (ConnectionParams)arg;
+            ConnectionParams connectionParams = arg as ConnectionParams;
 
-            PropertyListV5 properties = connectionParams.properties;
-
-            Error error = connectionParams == null
-                ? (Error)Native.mosquitto_reconnect(_mosq)
-                : (Error)Native.mosquitto_connect_bind_v5(_mosq, connectionParams.host, connectionParams.port, connectionParams.keepalive, connectionParams.bindAddress, properties.nativePropertyList);
-
-            connectionParams?.Dispose();
-
-            if (error != Error.Success)
+            Error error = Error.Success;
+            while(currentState != State.Disconnected)
             {
-                EnqueueCallbacks(_connectionCallbacks, new CallbackArgumentList { error = error });
-                _connectionCallbacks = default;
-                _state = State.Disconnected;
-            }
+                if (connectionParams != null)
+                {
+                    ClearReconnectSubscriptions();
 
-            Native.mosq_err_t rc = Native.mosq_err_t.MOSQ_ERR_SUCCESS;
-            while (_state != State.Disconnected && rc == Native.mosq_err_t.MOSQ_ERR_SUCCESS)
-            {
-                rc = Native.mosquitto_loop(_mosq, connectionParams.keepalive, 1);
+                    _loopTimeout = connectionParams.keepalive * 1000;
+
+                    error = (Error)Native.mosquitto_connect_bind_v5(
+                        _mosq, 
+                        connectionParams.host, 
+                        connectionParams.port,
+                        connectionParams.keepalive, 
+                        connectionParams.bindAddress,
+                        connectionParams.properties.nativePropertyList);
+                    connectionParams.Dispose();
+                    connectionParams = null;
+                }
+                else
+                {
+                    error = (Error)Native.mosquitto_reconnect(_mosq);
+                }
+
+                if (error != Error.Success)
+                {
+                    EnqueueCallbacks(GetConnectionCallbacks(), new CallbackArgumentList {error = error});
+                }
+
+                while (currentState != State.Disconnected && error == Error.Success)
+                {
+                    error = (Error)Native.mosquitto_loop(_mosq, _loopTimeout, 1);
+                }
+
+                ProcessSubscriptionsOnConnectionLost();
+
+                if (!TryWaitForReconnect())
+                {
+                    break;
+                }
             }
-            _state = State.Disconnected;
+            SetDisconnected(error);
         }
 
+        private void SetDisconnected(Error error, PropertyListV5 prop = default)
+        {
+            // only invoke callbacks if we aren't already disconnected
+            var prevState = ExchangeState(State.Disconnected);
+            if (prevState == State.Connecting || prevState == State.Disconnected)
+            {
+                return;
+            }
+
+            GetDisconnectedCallbacks(out var onDisconnected, out var onDisconnectedV5);
+            EnqueueCallbacks(
+                new CallbackList { context = _defaultContext, onDisconnected = onDisconnected, onDisconnectedV5 = onDisconnectedV5 },
+                new CallbackArgumentList {error = error, properties = ManagedPropertyListV5Pool.Obtain(prop)});
+        }
 
         private void HandleLog(MosquittoPtr mosq, IntPtr obj, int level, string message)
         {
@@ -929,17 +1088,45 @@ namespace Mosquitto
             return len;
         }
 
+        private CallbackList GetConnectionCallbacks()
+        {
+            lock (_connectionCallbackMutex)
+            {
+                var callbacks = _connectionCallbacks;
+                _connectionCallbacks = default;
+                return callbacks;
+            }
+        }
+
         protected virtual void ClearCallbacks()
         {
             onLogEvent = null;
             Interlocked.Exchange(ref _getPassword, null);
-            _connectionCallbacks = default;
-            _subscribeCallbacks.Clear();
-            _unsubscribeCallbacks.Clear();
-            _publishCallbacks.Clear();
+
+            lock (_connectionCallbackMutex)
+            {
+                _connectionCallbacks = default;
+            }
+            ClearSessionCallbacks();
         }
 
-        protected void SetupNativeCallbacks()
+        private void ClearSessionCallbacks()
+        { 
+            lock (_subscribeCallbacks)
+            {
+                _subscribeCallbacks.Clear();
+            }
+            lock (_unsubscribeCallbacks)
+            {
+                _unsubscribeCallbacks.Clear();
+            }
+            lock (_publishCallbacks)
+            {
+                _publishCallbacks.Clear();
+            }
+        }
+
+        private void SetupNativeCallbacks()
         {
             Native.mosquitto_log_callback_set(_mosq, HandleLog);
             Native.mosquitto_connect_v5_callback_set(_mosq, HandleConnected);
@@ -950,107 +1137,228 @@ namespace Mosquitto
             Native.mosquitto_message_v5_callback_set(_mosq, HandleMessageReceived);
         }
 
+        private void ClearReconnectSubscriptions()
+        {
+            _subscribeOnReconnectList.Clear();
+            _unsubscribeOnReconnectList.Clear();
+        }
+
+        private void ProcessSubscriptionsOnConnectionLost()
+        {
+            if (_cleanSession)
+            {
+                // First invoke callbacks for all unsubscribes, since clean session will clear them on the server anyway
+                lock (_unsubscribeCallbacks)
+                {
+                    foreach (var unsub in _unsubscribeCallbacks.Values)
+                    {
+                        _subscriptions.Remove(unsub.topic);
+                        EnqueueCallbacks(unsub.cb, default);
+                    }
+                    _unsubscribeCallbacks.Clear();
+                }
+
+                if (_reconnectSettings.reconnectAutomatically)
+                {
+                    // second, add all of our subscriptions to the resubscribe list
+                    foreach (var sub in _subscriptions)
+                    {
+                        _subscribeOnReconnectList.Add(new PendingSubscribe(sub.Key, sub.Value, default));
+                    }
+                    _subscriptions.Clear();
+                }
+            }
+
+            if (_reconnectSettings.reconnectAutomatically)
+            {
+                // third, readd all of our inflight subscribes to our list to resubscribe
+                // to make sure we are subscribed (unclear state on disconnect)
+                lock (_subscribeCallbacks)
+                {
+                    _subscribeOnReconnectList.AddRange(_subscribeCallbacks.Values);
+                    _subscribeCallbacks.Clear();
+                }
+
+                if (!_cleanSession)
+                {
+                    // finally, add all unsubscribes to our list of onsubs to invoke on
+                    // reconnect.
+                    lock (_unsubscribeCallbacks)
+                    {
+                        _unsubscribeOnReconnectList.AddRange(_unsubscribeCallbacks.Values);
+                        _unsubscribeCallbacks.Clear();
+                    }
+                }
+            }
+        }
+
+        private void ResendSubscriptions()
+        {
+            foreach (var sub in _subscribeOnReconnectList)
+            {
+                if (sub.topic != null)
+                {
+                    SubscribeInternal(sub.topic, sub.qos, onSubscribed: sub.cb.onSubscribed, onSubscribedV5: sub.cb.onSubscribedV5);
+                }
+                if (sub.topics != null)
+                {
+                    SubscribeMultipleInternal(sub.topics, sub.qos, onSubscribed: sub.cb.onSubscribedMultiple, onSubscribedV5: sub.cb.onSubscribedMultipleV5);
+                }
+            }
+            _subscribeOnReconnectList.Clear();
+
+            foreach (var unsub in _unsubscribeOnReconnectList)
+            {
+                UnsubscribeInternal(unsub.topic, onUnsubscribed: unsub.cb.onUnsubscribed, onUnsubscribedV5: unsub.cb.onUnsubscribedV5);
+            }
+            _unsubscribeOnReconnectList.Clear();
+        }
+
+        private bool TryWaitForReconnect()
+        {
+            _reconnectResetEvent.Reset();
+            if (!_reconnectSettings.reconnectAutomatically || !TryUpdateState(State.Reconnecting, State.Connected))
+            {
+                return false;
+            }
+
+            _reconnects++;
+            int retryMultiplier = _reconnectSettings.exponentialBackoff ? _reconnects * _reconnects : _reconnects;
+            int retryDelay = Math.Min(_reconnectSettings.initialReconnectDelay * retryMultiplier, _reconnectSettings.maximumReconnectDelay);
+
+            // wait until our timeout (in which case we reconnect), or a signal, in which case we break
+            if (_reconnectResetEvent.WaitOne(TimeSpan.FromSeconds(retryDelay)))
+            {
+                return false;
+            }
+            return true;
+        }
+
         private void HandleConnected(MosquittoPtr mosq, IntPtr obj, int rc, int flags, MosquittoPropertyPtr prop)
         {
             if (rc == 0)
             {
-                _state = State.Connected;
+                // only move to connected from connecting or reconnecting
+                TryUpdateState(State.Connected, State.Connecting);
+                if (TryUpdateState(State.Connected, State.Reconnecting, trueIfAlreadySet: false))
+                {
+                    ResendSubscriptions();
+                }
+
+                _reconnects = 0;
             }
             else
             {
-                // Manually map the Mosquitto v3.1.1 response codes to 
+                // Manually map the Mosquitto v3.1.1 response codes to
                 // a range that doesn't overlap with client error codes
                 if (rc < (int)ConnectFailedReason.Unspecified)
                 {
                     rc += (int)ConnectFailedReason.Unspecified;
                 }
-                _state = State.Disconnected;
             }
 
-            EnqueueCallbacks(_connectionCallbacks,
+            EnqueueCallbacks(GetConnectionCallbacks(),
                 new CallbackArgumentList { intValue = rc, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
-            _connectionCallbacks = default;
         }
 
         private void HandleDisconnected(MosquittoPtr mosq, IntPtr obj, int rc, MosquittoPropertyPtr prop)
         {
-            _state = State.Disconnected;
-            GetDisconnectedCallbacks(out var onDisconnected, out var onDisconnectedV5);
-            EnqueueCallbacks(new CallbackList { context = _defaultContext, onDisconnected = onDisconnected, onDisconnectedV5 = onDisconnectedV5 },
-                new CallbackArgumentList { intValue = rc, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
+            if (_reconnectSettings.reconnectAutomatically && currentState != State.Disconnecting)
+            {
+                // ignore this disconnect if we weren't disconnecting, we will try reconnecting in our thread
+                return;
+            }
+
+            SetDisconnected((Error)rc, new PropertyListV5(prop));
         }
 
         private void HandlePublished(MosquittoPtr mosq, IntPtr obj, int mid, int rc, MosquittoPropertyPtr prop)
         {
-            bool hasEvent = false;
-            CallbackList cb;
+            CallbackList cb = default;
             lock (_publishCallbacks)
             {
                 if (_publishCallbacks.TryGetValue(mid, out cb))
                 {
-                    hasEvent = true;
                     _publishCallbacks.Remove(mid);
                 }
             }
-            if (hasEvent)
-            {
-                EnqueueCallbacks(cb,
-                    new CallbackArgumentList { intValue = rc, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
-            }
+            EnqueueCallbacks(cb,
+                new CallbackArgumentList { intValue = rc, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
         }
 
         private void HandleSubscribed(MosquittoPtr mosq, IntPtr obj, int mid, int qos_count, IntPtr qos_list, MosquittoPropertyPtr prop)
         {
-            bool hasEvent = false;
-            CallbackList cb;
+            string topic = null;
+            string[] topics = null;
+            CallbackList cb = default;
             lock (_subscribeCallbacks)
             {
-                if (_subscribeCallbacks.TryGetValue(mid, out cb))
+                if (_subscribeCallbacks.TryGetValue(mid, out var subscribe))
                 {
-                    hasEvent = true;
+                    cb = subscribe.cb;
+                    topic = subscribe.topic;
+                    topics = subscribe.topics;
                     _subscribeCallbacks.Remove(mid);
                 }
             }
-            if (hasEvent)
+
+            QualityOfService qos = default;
+            QualityOfService[] qosList = null;
+
+            // only create QoS list if necessary
+            if (cb.onSubscribedMultiple != null || cb.onSubscribedMultipleV5 != null)
             {
-                if (qos_count == 0)
-                {
-                    return;
-                }
-
-                QualityOfService[] qosList = null;
-
-                // only create QoS list if necessary
-                if (cb.onSubscribedMultiple != null || cb.onSubscribedMultipleV5 != null)
-                {
-                    qosList = new QualityOfService[qos_count];
-                    for (int i = 0; i < qos_count; i++)
-                    {
-                        qosList[i] = (QualityOfService)Marshal.ReadInt32(IntPtr.Add(qos_list, 4 * i));
-                    }
-                }
-
-                EnqueueCallbacks(cb,
-                    new CallbackArgumentList { intValue = Marshal.ReadInt32(qos_list), qosList = qosList, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
+                qosList = new QualityOfService[qos_count];
             }
+
+            for (int i = 0; i < qos_count; i++)
+            {
+                if (topics != null && i < topics.Length)
+                {
+                    topic = topics[i];
+                }
+                
+                qos = (QualityOfService)Marshal.ReadInt32(IntPtr.Add(qos_list, 4 * i));
+
+                // if we use clean session, and auto reconnect, we need to manually
+                // record the list of subscriptions so that we can resubscribe on reconnect
+                if (_cleanSession && _reconnectSettings.reconnectAutomatically)
+                {
+                    _subscriptions[topic] = qos;
+                }
+                
+                if (qosList != null)
+                {
+                    qosList[i] = qos;
+                }
+            }
+
+            EnqueueCallbacks(cb,
+                new CallbackArgumentList { qos = qos, qosList = qosList, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
         }
         private void HandleUnsubscribed(MosquittoPtr mosq, IntPtr obj, int mid, MosquittoPropertyPtr prop)
         {
-            bool hasEvent = false;
-            CallbackList cb;
+            string topic = null;
+            CallbackList cb = default;
             lock (_unsubscribeCallbacks)
             {
-                if (_unsubscribeCallbacks.TryGetValue(mid, out cb))
+                if (_unsubscribeCallbacks.TryGetValue(mid, out var unsubscribe))
                 {
-                    hasEvent = true;
+                    topic = unsubscribe.topic;
+                    cb = unsubscribe.cb;
                     _unsubscribeCallbacks.Remove(mid);
                 }
             }
-            if (hasEvent)
+
+            // if we use clean session, and auto reconnect, we need to manually
+            // record the list of subscriptions so that we can resubscribe on reconnect
+            if (_cleanSession && _reconnectSettings.reconnectAutomatically)
             {
-                EnqueueCallbacks(cb,
-                    new CallbackArgumentList { properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
+                _subscriptions.Remove(topic);
             }
+
+            EnqueueCallbacks(cb,
+                new CallbackArgumentList { properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
         }
 
         private void HandleMessageReceived(MosquittoPtr mosq, IntPtr obj, ref Native.mosquitto_message msg, MosquittoPropertyPtr prop)
@@ -1066,7 +1374,7 @@ namespace Mosquitto
             string topic = Marshal.PtrToStringAnsi(msg.topic);
 
             EnqueueCallbacks(new CallbackList { context = _defaultContext, onMessageReceived = onMessageReceived, onMessageReceivedV5 = onMessageReceivedV5 },
-                new CallbackArgumentList { message = new Message(msg.mid, topic, payload, (QualityOfService)msg.qos, msg.retain), properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
+                new CallbackArgumentList { message = new Message(msg.mid, topic, payload, msg.payloadlen, (QualityOfService)msg.qos, msg.retain), properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
 
         }
 

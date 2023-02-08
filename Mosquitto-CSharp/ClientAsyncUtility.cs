@@ -12,6 +12,7 @@ namespace Mosquitto
             private readonly TaskCompletionSource<T> _tcs = new TaskCompletionSource<T>();
             private readonly CancellationToken _token;
             private readonly Client _client;
+            private bool _successOnDisconnect;
 
             private CancellationTokenRegistration _ctr;
 
@@ -27,6 +28,26 @@ namespace Mosquitto
                 _client.onDisconnectedEvent += OnDisconnected;
 
                 _client.Connect(host, port, keepalive, bindAddress, onConnected: OnConnected, onConnectFailed: OnConnectFailed);
+
+                return _tcs.Task;
+            }
+
+            public Task DisconnectAsync()
+            {
+                _successOnDisconnect = true;
+
+                _client.onDisconnectedEvent += OnDisconnected;
+
+                _client.Disconnect();
+
+                return _tcs.Task;
+            }
+
+            public Task ReconnectAsync()
+            {
+                _client.onDisconnectedEvent += OnDisconnected;
+
+                _client.Reconnect(onConnected: OnConnected, onConnectFailed: OnConnectFailed);
 
                 return _tcs.Task;
             }
@@ -142,7 +163,14 @@ namespace Mosquitto
 
             void OnDisconnected(Error error)
             {
-                _tcs.TrySetException(new ErrorException(error));
+                if (_successOnDisconnect && error == Error.Success)
+                {
+                    _tcs.TrySetResult(default);
+                }
+                else
+                {
+                    _tcs.TrySetException(new ErrorException(error));
+                }
                 Dispose();
             }
 
@@ -157,6 +185,16 @@ namespace Mosquitto
             string bindAddress = null, CancellationToken cancellationToken = default)
         {
             return new CaptureState<bool>(client, cancellationToken).ConnectAsync(host, port, keepalive, bindAddress);
+        }
+
+        public static Task DisconnectAsync(this Client client, CancellationToken cancellationToken = default)
+        {
+            return new CaptureState<bool>(client, cancellationToken).DisconnectAsync();
+        }
+
+        public static Task ReconnectAsync(this Client client, CancellationToken cancellationToken = default)
+        {
+            return new CaptureState<bool>(client, cancellationToken).ReconnectAsync();
         }
 
         public static Task<QualityOfService> SubscribeAsync(this Client client, string topic,

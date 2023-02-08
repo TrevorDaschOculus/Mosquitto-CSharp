@@ -14,8 +14,8 @@ namespace Mosquitto
         public event OnMessageReceivedV5 onMessageReceivedEvent;
         #endregion
 
-        public ClientV5(string id, bool cleanSession = true) : base(id, cleanSession,
-            Native.PROTOCOL_VERSION_v5)
+        public ClientV5(string id, bool cleanSession = true, ReconnectSettings reconnectSettings = default) : base(id, cleanSession,
+            Native.PROTOCOL_VERSION_v5, reconnectSettings)
         { }
 
         /// <summary>
