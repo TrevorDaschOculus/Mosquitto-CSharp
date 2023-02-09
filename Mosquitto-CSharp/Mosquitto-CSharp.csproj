@@ -59,6 +59,7 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="ReconnectSettings.cs" />
     <Compile Include="ClientAsyncUtility.cs" />
     <Compile Include="ConnectFailedException.cs" />
     <Compile Include="ConnectFailedReason.cs" />

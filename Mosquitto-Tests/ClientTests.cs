@@ -416,7 +416,7 @@ namespace Mosquitto.Tests
         public async Task SubscribeAfterAutoReconnect(bool clearSession)
         {
             int port = _port;
-            using (var client = new Client("test", clearSession, reconnectSettings: new ClientBase.ReconnectSettings(reconnectAutomatically: true, maximumReconnectDelay: 1)))
+            using (var client = new Client("test", clearSession, reconnectSettings: new ReconnectSettings(reconnectAutomatically: true, maximumReconnectDelay: 1)))
             {
                 int disconnectCount = 0;
                 void OnDisconnected(Error err)

@@ -135,6 +135,7 @@ namespace Mosquitto
         /// </summary>
         internal const uint LIBMOSQUITTO_VERSION_NUMBER = (LIBMOSQUITTO_MAJOR * 1000000 + LIBMOSQUITTO_MINOR * 1000 + LIBMOSQUITTO_REVISION);
 
+        internal const int PROTOCOL_VERSION_v31 = 3;
         internal const int PROTOCOL_VERSION_v311 = 4;
         internal const int PROTOCOL_VERSION_v5 = 5;
 

@@ -438,23 +438,6 @@ namespace Mosquitto
             }
         }
 
-        public struct ReconnectSettings
-        {
-            public readonly bool reconnectAutomatically;
-            public readonly int initialReconnectDelay;
-            public readonly int maximumReconnectDelay;
-            public readonly bool exponentialBackoff;
-
-            public ReconnectSettings(bool reconnectAutomatically, int initialReconnectDelay = 1,
-                int maximumReconnectDelay = 60, bool exponentialBackoff = true)
-            {
-                this.reconnectAutomatically = reconnectAutomatically;
-                this.initialReconnectDelay = initialReconnectDelay;
-                this.maximumReconnectDelay = maximumReconnectDelay;
-                this.exponentialBackoff = exponentialBackoff;
-            }
-        }
-
         private enum State
         {
             New,
@@ -786,6 +769,28 @@ namespace Mosquitto
             Interlocked.Exchange(ref _getPassword, getPassword);
 
             return (Error)Native.mosquitto_tls_set(_mosq, cafile, capath, certfile, keyfile, PasswordCallback);
+        }
+
+        /// <summary>
+        /// <para>
+        /// Configure verification of the server hostname in the server certificate. If
+        /// value is set to true, it is impossible to guarantee that the host you are
+        /// connecting to is not impersonating your server. This can be useful in
+        /// initial server testing, but makes it possible for a malicious third party to
+        /// impersonate your server through DNS spoofing, for example.
+        /// </para>
+        /// <para>
+        /// Do not use this function in a real system. Setting value to true makes the
+        /// connection encryption pointless.
+        /// </para>
+        /// <para>
+        /// Must be called before Connect/>.
+        /// </para>
+        /// </summary>
+        /// <param name="insecure">if set to false, the default, certificate hostname checking is performed. If set to true, no hostname checking is performed and the connection is insecure.</param>
+        public Error SetTlsInsecure(bool insecure)
+        {
+            return (Error)Native.mosquitto_tls_insecure_set(_mosq, insecure);
         }
 
 
