@@ -635,6 +635,7 @@ namespace Mosquitto
         private readonly Dictionary<int, PendingUnsubscribe> _unsubscribeCallbacks = new Dictionary<int, PendingUnsubscribe>();
         private readonly Dictionary<int, CallbackList> _publishCallbacks = new Dictionary<int, CallbackList>();
 
+        private GCHandle _self;
         private MosquittoPtr _mosq;
 
 
@@ -671,7 +672,8 @@ namespace Mosquitto
         {
             // ensure our library is initialized
             Native.Initialize();
-            _mosq = Native.mosquitto_new(id, cleanSession, IntPtr.Zero);
+            _self = GCHandle.Alloc(this, GCHandleType.WeakTrackResurrection);
+            _mosq = Native.mosquitto_new(id, cleanSession, GCHandle.ToIntPtr(_self));
             _protocolVersion = protocolVersion;
             _cleanSession = cleanSession;
             _reconnectSettings = reconnectSettings;
@@ -697,7 +699,7 @@ namespace Mosquitto
             DisconnectInternal(disconnectImmediately: true);
             WaitForThread();
             ClearCallbacks();
-            var result = (Error)Native.mosquitto_reinitialise(_mosq, id, cleanSession, IntPtr.Zero);
+            var result = (Error)Native.mosquitto_reinitialise(_mosq, id, cleanSession, GCHandle.ToIntPtr(_self));
             if (result != Error.Success)
             {
                 return result;
@@ -825,6 +827,7 @@ namespace Mosquitto
                 Native.mosquitto_destroy(_mosq);
                 _mosq = IntPtr.Zero;
             }
+            _self.Free();
 
             ClearCallbacks();
 
@@ -1112,26 +1115,6 @@ namespace Mosquitto
                 new CallbackArgumentList { error = error, properties = ManagedPropertyListV5Pool.Obtain(prop) });
         }
 
-        private void HandleLog(MosquittoPtr mosq, IntPtr obj, int level, string message)
-        {
-            EnqueueCallbacks(new CallbackList { context = _defaultContext, onLog = onLogEvent }, new CallbackArgumentList { intValue = level, logMessage = message });
-        }
-
-        private int PasswordCallback(IntPtr buf, int size, int rwflag, MosquittoPtr mosq)
-        {
-            GetPassword getPassword = Interlocked.CompareExchange(ref _getPassword, null, null);
-            if (getPassword == null)
-            {
-                return 0;
-            }
-
-            var pass = getPassword.Invoke();
-            int len = Math.Min(pass.Length, size);
-
-            Marshal.Copy(pass, 0, buf, len);
-            return len;
-        }
-
         private CallbackList GetConnectionCallbacks()
         {
             lock (_connectionCallbackMutex)
@@ -1278,20 +1261,62 @@ namespace Mosquitto
             return true;
         }
 
-        private void HandleConnected(MosquittoPtr mosq, IntPtr obj, int rc, int flags, MosquittoPropertyPtr prop)
+        private static ClientBase FromIntPtr(IntPtr obj)
         {
+            return GCHandle.FromIntPtr(obj).Target as ClientBase;
+        }
+
+        private static int PasswordCallback(IntPtr buf, int size, int rwflag, MosquittoPtr mosq)
+        {
+            var self = FromIntPtr(Native.mosquitto_userdata(mosq));
+            if (self == null)
+            {
+                return 0;
+            }
+
+            GetPassword getPassword = Interlocked.CompareExchange(ref self._getPassword, null, null);
+            if (getPassword == null)
+            {
+                return 0;
+            }
+
+            var pass = getPassword.Invoke();
+            int len = Math.Min(pass.Length, size);
+
+            Marshal.Copy(pass, 0, buf, len);
+            return len;
+        }
+
+        private static void HandleLog(MosquittoPtr mosq, IntPtr obj, int level, string message)
+        {
+            var self = FromIntPtr(Native.mosquitto_userdata(mosq));
+            if (self == null)
+            {
+                return;
+            }
+            self.EnqueueCallbacks(new CallbackList { context = self._defaultContext, onLog = self.onLogEvent }, new CallbackArgumentList { intValue = level, logMessage = message });
+        }
+
+
+        private static void HandleConnected(MosquittoPtr mosq, IntPtr obj, int rc, int flags, MosquittoPropertyPtr prop)
+        {
+            var self = FromIntPtr(obj);
+            if (self == null)
+            {
+                return;
+            }
             if (rc == 0)
             {
                 // only move to connected from connecting or reconnecting
-                TryUpdateState(State.Connected, State.Connecting);
-                if (TryUpdateState(State.Connected, State.Reconnecting, trueIfAlreadySet: false))
+                self.TryUpdateState(State.Connected, State.Connecting);
+                if (self.TryUpdateState(State.Connected, State.Reconnecting, trueIfAlreadySet: false))
                 {
-                    ResendSubscriptions();
+                    self.ResendSubscriptions();
                 }
 
-                _reconnects = 0;
+                self._reconnects = 0;
 
-                EnqueueCallbacks(GetConnectionCallbacks(),
+                self.EnqueueCallbacks(self.GetConnectionCallbacks(),
                     new CallbackArgumentList { properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
             }
             else
@@ -1303,43 +1328,58 @@ namespace Mosquitto
                     rc += (int)ConnectFailedReason.Unspecified;
                 }
 
-                SetDisconnected((Error)rc, new PropertyListV5(prop), tryReconnecting: true);
+                self.SetDisconnected((Error)rc, new PropertyListV5(prop), tryReconnecting: true);
             }
 
         }
 
-        private void HandleDisconnected(MosquittoPtr mosq, IntPtr obj, int rc, MosquittoPropertyPtr prop)
+        private static void HandleDisconnected(MosquittoPtr mosq, IntPtr obj, int rc, MosquittoPropertyPtr prop)
         {
-            SetDisconnected((Error)rc, new PropertyListV5(prop), tryReconnecting: true);
+            var self = FromIntPtr(obj);
+            if (self == null)
+            {
+                return;
+            }
+            self.SetDisconnected((Error)rc, new PropertyListV5(prop), tryReconnecting: true);
         }
 
-        private void HandlePublished(MosquittoPtr mosq, IntPtr obj, int mid, int rc, MosquittoPropertyPtr prop)
+        private static void HandlePublished(MosquittoPtr mosq, IntPtr obj, int mid, int rc, MosquittoPropertyPtr prop)
         {
-            CallbackList cb = default;
-            lock (_publishCallbacks)
+            var self = FromIntPtr(obj);
+            if (self == null)
             {
-                if (_publishCallbacks.TryGetValue(mid, out cb))
+                return;
+            }
+            CallbackList cb = default;
+            lock (self._publishCallbacks)
+            {
+                if (self._publishCallbacks.TryGetValue(mid, out cb))
                 {
-                    _publishCallbacks.Remove(mid);
+                    self._publishCallbacks.Remove(mid);
                 }
             }
-            EnqueueCallbacks(cb,
+            self.EnqueueCallbacks(cb,
                 new CallbackArgumentList { intValue = rc, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
         }
 
-        private void HandleSubscribed(MosquittoPtr mosq, IntPtr obj, int mid, int qos_count, IntPtr qos_list, MosquittoPropertyPtr prop)
+        private static void HandleSubscribed(MosquittoPtr mosq, IntPtr obj, int mid, int qos_count, IntPtr qos_list, MosquittoPropertyPtr prop)
         {
+            var self = FromIntPtr(obj);
+            if (self == null)
+            {
+                return;
+            }
             string topic = null;
             string[] topics = null;
             CallbackList cb = default;
-            lock (_subscribeCallbacks)
+            lock (self._subscribeCallbacks)
             {
-                if (_subscribeCallbacks.TryGetValue(mid, out var subscribe))
+                if (self._subscribeCallbacks.TryGetValue(mid, out var subscribe))
                 {
                     cb = subscribe.cb;
                     topic = subscribe.topic;
                     topics = subscribe.topics;
-                    _subscribeCallbacks.Remove(mid);
+                    self._subscribeCallbacks.Remove(mid);
                 }
             }
 
@@ -1363,9 +1403,9 @@ namespace Mosquitto
 
                 // if we use clean session, and auto reconnect, we need to manually
                 // record the list of subscriptions so that we can resubscribe on reconnect
-                if (_cleanSession && _reconnectSettings.reconnectAutomatically)
+                if (self._cleanSession && self._reconnectSettings.reconnectAutomatically)
                 {
-                    _subscriptions[topic] = qos;
+                    self._subscriptions[topic] = qos;
                 }
                 
                 if (qosList != null)
@@ -1374,37 +1414,47 @@ namespace Mosquitto
                 }
             }
 
-            EnqueueCallbacks(cb,
+            self.EnqueueCallbacks(cb,
                 new CallbackArgumentList { qos = qos, qosList = qosList, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
         }
-        private void HandleUnsubscribed(MosquittoPtr mosq, IntPtr obj, int mid, MosquittoPropertyPtr prop)
+        private static void HandleUnsubscribed(MosquittoPtr mosq, IntPtr obj, int mid, MosquittoPropertyPtr prop)
         {
+            var self = FromIntPtr(obj);
+            if (self == null)
+            {
+                return;
+            }
             string topic = null;
             CallbackList cb = default;
-            lock (_unsubscribeCallbacks)
+            lock (self._unsubscribeCallbacks)
             {
-                if (_unsubscribeCallbacks.TryGetValue(mid, out var unsubscribe))
+                if (self._unsubscribeCallbacks.TryGetValue(mid, out var unsubscribe))
                 {
                     topic = unsubscribe.topic;
                     cb = unsubscribe.cb;
-                    _unsubscribeCallbacks.Remove(mid);
+                    self._unsubscribeCallbacks.Remove(mid);
                 }
             }
 
             // if we use clean session, and auto reconnect, we need to manually
             // record the list of subscriptions so that we can resubscribe on reconnect
-            if (_cleanSession && _reconnectSettings.reconnectAutomatically)
+            if (self._cleanSession && self._reconnectSettings.reconnectAutomatically)
             {
-                _subscriptions.Remove(topic);
+                self._subscriptions.Remove(topic);
             }
 
-            EnqueueCallbacks(cb,
+            self.EnqueueCallbacks(cb,
                 new CallbackArgumentList { properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
         }
 
-        private void HandleMessageReceived(MosquittoPtr mosq, IntPtr obj, ref Native.mosquitto_message msg, MosquittoPropertyPtr prop)
+        private static void HandleMessageReceived(MosquittoPtr mosq, IntPtr obj, ref Native.mosquitto_message msg, MosquittoPropertyPtr prop)
         {
-            GetMessageReceivedCallbacks(out var onMessageReceived, out var onMessageReceivedV5);
+            var self = FromIntPtr(obj);
+            if (self == null)
+            {
+                return;
+            }
+            self.GetMessageReceivedCallbacks(out var onMessageReceived, out var onMessageReceivedV5);
             if (onMessageReceived == null && onMessageReceivedV5 == null)
             {
                 return;
@@ -1414,7 +1464,7 @@ namespace Mosquitto
             Marshal.Copy(msg.payload, payload, 0, msg.payloadlen);
             string topic = Marshal.PtrToStringAnsi(msg.topic);
 
-            EnqueueCallbacks(new CallbackList { context = _defaultContext, onMessageReceived = onMessageReceived, onMessageReceivedV5 = onMessageReceivedV5 },
+            self.EnqueueCallbacks(new CallbackList { context = self._defaultContext, onMessageReceived = onMessageReceived, onMessageReceivedV5 = onMessageReceivedV5 },
                 new CallbackArgumentList { message = new Message(msg.mid, topic, payload, msg.payloadlen, (QualityOfService)msg.qos, msg.retain), properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
 
         }
