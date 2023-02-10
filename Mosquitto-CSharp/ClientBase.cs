@@ -441,8 +441,10 @@ namespace Mosquitto
         private enum State
         {
             New,
+            // Connecting is used for both both calls to Connect and Reconnect
             Connecting,
             Connected,
+            // Reconnecting is only used for automatic reconnects
             Reconnecting,
             Disconnecting,
             Disconnected,
@@ -861,7 +863,7 @@ namespace Mosquitto
                 return;
             }
 
-            if (currentState == State.Connecting || currentState == State.Connected || currentState == State.Reconnecting)
+            if (IsActiveState(currentState))
             {
                 callbackList.onConnectFailed?.Invoke(Error.AlreadyExists, ConnectFailedReason.Unspecified);
                 connectionParams?.Dispose();
@@ -870,16 +872,12 @@ namespace Mosquitto
 
             WaitForThread();
 
-            if (connectionParams == null)
-            {
-                this.currentState = State.Reconnecting;
-            }
-            else
+            if (connectionParams != null)
             {
                 ClearSessionCallbacks();
-                this.currentState = State.Connecting;
             }
 
+            this.currentState = State.Connecting;
             lock (_connectionCallbackMutex)
             {
                 _connectionCallbacks = callbackList;
@@ -956,25 +954,32 @@ namespace Mosquitto
 
         protected Error DisconnectInternal(bool disconnectImmediately = false, bool sendWill = false, PropertyListV5 properties = default)
         {
-            var currentState = this.currentState;
-            if (currentState == State.Disposed)
+            while (true)
             {
-                return Error.Inval;
+                var currentState = this.currentState;
+                if (currentState == State.Disposed)
+                {
+                    return Error.Inval;
+                }
+
+                if (currentState == State.Disconnected || (currentState == State.Disconnecting && !disconnectImmediately))
+                {
+                    return Error.Success;
+                }
+
+                if (disconnectImmediately)
+                {
+                    SetDisconnected(Error.Success);
+                    break;
+                }
+
+                // try to update the state. If this fails, reevaluate the current state
+                if (TryUpdateState(State.Disconnecting, currentState))
+                {
+                    break;
+                }
             }
 
-            if (currentState == State.Disconnected || (currentState == State.Disconnecting && !disconnectImmediately))
-            {
-                return Error.Success;
-            }
-
-            if (disconnectImmediately)
-            {
-                SetDisconnected(Error.Success);
-            }
-            else
-            {
-                this.currentState = State.Disconnecting;
-            }
             _reconnectResetEvent.Set();
             return (Error)Native.mosquitto_disconnect_v5(_mosq, sendWill ? (int)DisconnectReasonV5.DisconnectWithWillMsg : (int)DisconnectReasonV5.NormalDisconnection, properties.nativePropertyList);
         }
@@ -1015,7 +1020,7 @@ namespace Mosquitto
             ConnectionParams connectionParams = arg as ConnectionParams;
 
             Error error = Error.Success;
-            while(currentState != State.Disconnected)
+            while(IsActiveState(currentState))
             {
                 if (connectionParams != null)
                 {
@@ -1038,12 +1043,7 @@ namespace Mosquitto
                     error = (Error)Native.mosquitto_reconnect(_mosq);
                 }
 
-                if (error != Error.Success)
-                {
-                    EnqueueCallbacks(GetConnectionCallbacks(), new CallbackArgumentList {error = error});
-                }
-
-                while (currentState != State.Disconnected && error == Error.Success)
+                while (IsActiveState(currentState) && error == Error.Success)
                 {
                     error = (Error)Native.mosquitto_loop(_mosq, _loopTimeout, 1);
                 }
@@ -1058,19 +1058,58 @@ namespace Mosquitto
             SetDisconnected(error);
         }
 
-        private void SetDisconnected(Error error, PropertyListV5 prop = default)
+        private bool IsActiveState(State state)
         {
-            // only invoke callbacks if we aren't already disconnected
-            var prevState = ExchangeState(State.Disconnected);
-            if (prevState == State.Connecting || prevState == State.Disconnected)
+            switch(state)
+            {
+                case State.Connecting:
+                case State.Reconnecting:
+                case State.Connected:
+                case State.Disconnecting:
+                    return true;
+                case State.New:
+                case State.Disconnected:
+                case State.Disposed:
+                default:
+                    return false;
+            }
+        }
+
+        private void SetDisconnected(Error error, PropertyListV5 prop = default, bool tryReconnecting = false)
+        {
+            if (tryReconnecting && _reconnectSettings.reconnectAutomatically && TryUpdateState(State.Reconnecting, State.Connected))
             {
                 return;
             }
 
+            var prevState = ExchangeState(State.Disconnected);
+            // only invoke callbacks if we aren't already disconnected
+            if (prevState == State.Disconnected)
+            {
+                return;
+            }
+
+            // if we were connecting and our initial callbacks were not invoked, invoke them now
+            if (prevState == State.Connecting)
+            {
+                var cb = GetConnectionCallbacks();
+                EnqueueCallbacks(
+                    cb,
+                    // a successful disconnect will have error success, but we still want to invoke onConnectFailed, so we set the error to 'Cancelled' 
+                    new CallbackArgumentList { error = error == Error.Success ? Error.Cancelled : error, properties = ManagedPropertyListV5Pool.Obtain(prop) });
+
+                // if this triggers our onConnectFailed callback, we skip the onDisconnected callback
+                if (!cb.isEmpty)
+                {
+                    return;
+                }
+            }
+
+            // Invoke the onDisconnected callbacks
             GetDisconnectedCallbacks(out var onDisconnected, out var onDisconnectedV5);
             EnqueueCallbacks(
                 new CallbackList { context = _defaultContext, onDisconnected = onDisconnected, onDisconnectedV5 = onDisconnectedV5 },
-                new CallbackArgumentList {error = error, properties = ManagedPropertyListV5Pool.Obtain(prop)});
+                new CallbackArgumentList { error = error, properties = ManagedPropertyListV5Pool.Obtain(prop) });
         }
 
         private void HandleLog(MosquittoPtr mosq, IntPtr obj, int level, string message)
@@ -1251,6 +1290,9 @@ namespace Mosquitto
                 }
 
                 _reconnects = 0;
+
+                EnqueueCallbacks(GetConnectionCallbacks(),
+                    new CallbackArgumentList { properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
             }
             else
             {
@@ -1260,21 +1302,15 @@ namespace Mosquitto
                 {
                     rc += (int)ConnectFailedReason.Unspecified;
                 }
+
+                SetDisconnected((Error)rc, new PropertyListV5(prop), tryReconnecting: true);
             }
 
-            EnqueueCallbacks(GetConnectionCallbacks(),
-                new CallbackArgumentList { intValue = rc, properties = ManagedPropertyListV5Pool.Obtain(new PropertyListV5(prop)) });
         }
 
         private void HandleDisconnected(MosquittoPtr mosq, IntPtr obj, int rc, MosquittoPropertyPtr prop)
         {
-            if (_reconnectSettings.reconnectAutomatically && currentState != State.Disconnecting)
-            {
-                // ignore this disconnect if we weren't disconnecting, we will try reconnecting in our thread
-                return;
-            }
-
-            SetDisconnected((Error)rc, new PropertyListV5(prop));
+            SetDisconnected((Error)rc, new PropertyListV5(prop), tryReconnecting: true);
         }
 
         private void HandlePublished(MosquittoPtr mosq, IntPtr obj, int mid, int rc, MosquittoPropertyPtr prop)

@@ -2,6 +2,9 @@
 {
     public enum Error
     {
+        // Custom Cancelled error code if we force disconnect while connecting
+        Cancelled = -10,
+
         AuthContinue = Native.mosq_err_t.MOSQ_ERR_AUTH_CONTINUE,
         NoSubscribers = Native.mosq_err_t.MOSQ_ERR_NO_SUBSCRIBERS,
         SubExists = Native.mosq_err_t.MOSQ_ERR_SUB_EXISTS,
