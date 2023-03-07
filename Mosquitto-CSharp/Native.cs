@@ -44,6 +44,11 @@ namespace Mosquitto
 		private const string cryptoNativeLibrary = "libcrypto";
 		private const string sslNativeLibrary = "libssl";
 		private const string memoryNativeLibrary = "libmemory";
+#elif UNITY_EDITOR_WIN
+        private const string nativeLibrary = "mosquitto";
+        private const string cryptoNativeLibrary = "libcrypto-1_1-x64";
+        private const string sslNativeLibrary = "libssl-1_1-x64";
+        private const string memoryNativeLibrary = "memory";
 #else
         private const string nativeLibrary = "mosquitto";
         private const string cryptoNativeLibrary = "crypto";
@@ -66,8 +71,13 @@ namespace Mosquitto
 		private const string cryptoNativeLibrary = "__Internal";
 		private const string sslNativeLibrary = "__Internal";
 		private const string memoryNativeLibrary = "__Internal";
+#elif UNITY_STANDALONE_WIN || WINDOWS
+        private const string nativeLibrary = "mosquitto";
+        private const string cryptoNativeLibrary = "libcrypto-1_1-x64";
+        private const string sslNativeLibrary = "libssl-1_1-x64";
+        private const string memoryNativeLibrary = "memory";
 #else
-		// Assume everything else, Windows et al.
+		// Assume everything else
 		private const string nativeLibrary = "mosquitto";
 		private const string cryptoNativeLibrary = "crypto";
 		private const string sslNativeLibrary = "ssl";

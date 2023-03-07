@@ -35,6 +35,14 @@ SOFTWARE.
         <OSPlatformOSX Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))' == 'true'">true</OSPlatformOSX>
     </PropertyGroup>
 
+    <PropertyGroup Condition="'$(OSPlatformWindows)' == 'true'">
+        <DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(OSPlatformLinux)' == 'true'">
+        <DefineConstants>$(DefineConstants);LINUX</DefineConstants>
+    </PropertyGroup>
+
     <PropertyGroup>
         <PluginPrefix Condition="'$(OSPlatformLinux)' == 'true'">lib</PluginPrefix>
 		<PluginPrefix Condition="'$(OSPlatformOSX)' == 'true'">lib</PluginPrefix>

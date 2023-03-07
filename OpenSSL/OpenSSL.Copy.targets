@@ -22,28 +22,24 @@ SOFTWARE.
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
 
     <Target Name="OpenSSLContentCopy" AfterTargets="Build">
+
         <PropertyGroup>
-            <OpenSSLPlatform Condition="'$(Platform)' == 'x86_64' OR '$(Platform)' == 'x64' OR '$(Platform)' == 'AnyCPU'">x64</OpenSSLPlatform>
-            <OpenSSLPlatform Condition="'$(Platform)' == 'x86'">x86</OpenSSLPlatform>
+            <OpenSSLVersion Condition="'$(OSPlatformWindows)' == 'true'">-1_1</OpenSSLVersion>
+            <OpenSSLArch Condition="'$(Platform)' == 'x86_64' OR '$(Platform)' == 'x64' OR '$(Platform)' == 'AnyCPU'">-x64</OpenSSLArch>
+            <OpenSSLArch Condition="'$(Platform)' == 'x86'"></OpenSSLArch>
+            <OpenSSLLibDir Condition="'$(OSPlatformWindows)' == 'true'">$(SlnDir)third-party/openssl/out/Windows/bin</OpenSSLLibDir>
+            <OpenSSLLibDir Condition="'$(OSPlatformWindows)' != 'true'">$(SlnDir)third-party/openssl/out/Linux/lib</OpenSSLLibDir>
 
-            <CryptoPluginFullPath Condition="'$(OSPlatformWindows)' == 'true'">$(SlnDir)third-party\openssl\out\Windows\bin\libcrypto-1_1-$(OpenSSLPlatform).$(PluginExt)</CryptoPluginFullPath>
-            <CryptoPluginFullPath Condition="'$(OSPlatformWindows)' != 'true'">$(SlnDir)third-party/openssl/out/Linux\lib\libcrypto.$(PluginExt)</CryptoPluginFullPath>
-            <SslPluginFullPath Condition="'$(OSPlatformWindows)' == 'true'">$(SlnDir)third-party\openssl\out\Windows\bin\libssl-1_1-$(OpenSSLPlatform).$(PluginExt)</SslPluginFullPath>
-            <SslPluginFullPath Condition="'$(OSPlatformWindows)' != 'true'">$(SlnDir)third-party/openssl/out/Linux\lib\libssl.$(PluginExt)</SslPluginFullPath>
-            <CryptoOutputFullPath>$(OutputPath)$(PluginPrefix)crypto.$(PluginExt)</CryptoOutputFullPath>
-            <SslOutputFullPath>$(OutputPath)$(PluginPrefix)ssl.$(PluginExt)</SslOutputFullPath>
-
-            <CryptoPdbPluginFullPath>$(SlnDir)third-party\openssl\out\Windows\bin\libcrypto-1_1-$(OpenSSLPlatform).pdb</CryptoPdbPluginFullPath>
-            <SslPdbPluginFullPath>$(SlnDir)third-party\openssl\out\Windows\bin\libssl-1_1-$(OpenSSLPlatform).pdb</SslPdbPluginFullPath>
-            <CryptoPdbOutputFullPath>$(OutputPath)$(PluginPrefix)crypto.pdb</CryptoPdbOutputFullPath>
-            <SslPdbOutputFullPath>$(OutputPath)$(PluginPrefix)ssl.pdb</SslPdbOutputFullPath>
+            <CryptoPluginName>libcrypto$(OpenSSLVersion)$(OpenSSLArch).$(PluginExt)</CryptoPluginName>
+            <SslPluginName>libssl$(OpenSSLVersion)$(OpenSSLArch).$(PluginExt)</SslPluginName>
+            <CryptoPdbName>libcrypto$(OpenSSLVersion)$(OpenSSLArch).pdb</CryptoPdbName>
+            <SslPdbName>libssl$(OpenSSLVersion)$(OpenSSLArch).pdb</SslPdbName>
         </PropertyGroup>
 
-        <Copy SourceFiles="$(CryptoPluginFullPath)" DestinationFiles="$(CryptoOutputFullPath)" SkipUnchangedFiles="true" />
-        <Copy SourceFiles="$(SslPluginFullPath)" DestinationFiles="$(SslOutputFullPath)" SkipUnchangedFiles="true" />
-        
-        <Copy Condition="'$(OSPlatformWindows)' == 'true'" SourceFiles="$(CryptoPdbPluginFullPath)" DestinationFiles="$(CryptoPdbOutputFullPath)" SkipUnchangedFiles="true" />
-        <Copy Condition="'$(OSPlatformWindows)' == 'true'" SourceFiles="$(SslPdbPluginFullPath)" DestinationFiles="$(SslPdbOutputFullPath)" SkipUnchangedFiles="true" />
+        <Copy SourceFiles="$(OpenSSLLibDir)/$(CryptoPluginName)" DestinationFiles="$(OutputPath)/$(CryptoPluginName)" SkipUnchangedFiles="true" />
+        <Copy SourceFiles="$(OpenSSLLibDir)/$(SslPluginName)"  DestinationFiles="$(OutputPath)/$(SslPluginName)" SkipUnchangedFiles="true" />
+        <Copy Condition="'$(OSPlatformWindows)' == 'true'" SourceFiles="$(OpenSSLLibDir)/$(CryptoPdbName)" DestinationFiles="$(OutputPath)/$(CryptoPdbName)" SkipUnchangedFiles="true" />
+        <Copy Condition="'$(OSPlatformWindows)' == 'true'" SourceFiles="$(OpenSSLLibDir)/$(SslPdbName)"  DestinationFiles="$(OutputPath)/$(SslPdbName)" SkipUnchangedFiles="true" />
     </Target>
 
 </Project>
