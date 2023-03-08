@@ -43,6 +43,10 @@ SOFTWARE.
         <DefineConstants>$(DefineConstants);LINUX</DefineConstants>
     </PropertyGroup>
 
+    <PropertyGroup Condition="'$(Platform)' == 'x86_64' OR '$(Platform)' == 'x64' OR '$(Platform)' == 'AnyCPU'">
+        <DefineConstants>$(DefineConstants);MOSQUITTO_64</DefineConstants>
+    </PropertyGroup>
+
     <PropertyGroup>
         <PluginPrefix Condition="'$(OSPlatformLinux)' == 'true'">lib</PluginPrefix>
 		<PluginPrefix Condition="'$(OSPlatformOSX)' == 'true'">lib</PluginPrefix>
